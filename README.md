@@ -6,7 +6,7 @@
 
 ## 输入目录
 
-默认输入目录是当前目录。主流程会先合并以下 4 个文件夹中的所有 `.txt` 文件：
+默认输入目录是当前工作目录。主流程会先合并以下 4 个文件夹中的所有 `.txt` 文件：
 
 | 源目录 | 合并后的中间文件 | 内容 |
 | --- | --- | --- |
@@ -35,7 +35,7 @@ l_simp_chinese:
 
 ## 快速使用
 
-在仓库根目录运行：
+从 Victoria 3\game\common 或者mod文件夹复制buildings,goods,production_methods,production_methods_groups文件夹，粘贴到仓库根目录，在仓库根目录运行：
 
 ```powershell
 python Vic3_analyzer\main.py
