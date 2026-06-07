@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
+
+
+TOP_LEVEL_OPERATION_RE = re.compile(r"^\s*(REPLACE|TRY_REPLACE|INJECT|TRY_INJECT|TRT_INJECT):", re.MULTILINE)
 
 
 def normalize_output_path(source_dir: Path, output_name: str) -> Path:
@@ -18,12 +22,20 @@ def collect_txt_files(source_dir: Path, output_path: Path) -> list[Path]:
     output_path = output_path.resolve()
     txt_files: list[Path] = []
 
-    for path in sorted(source_dir.glob("*.txt"), key=lambda item: item.name.lower()):
+    for path in sorted(source_dir.glob("*.txt"), key=txt_sort_key):
         if path.resolve() == output_path:
             continue
         txt_files.append(path)
 
     return txt_files
+
+
+def txt_sort_key(path: Path) -> tuple[int, str]:
+    try:
+        has_operation_prefix = bool(TOP_LEVEL_OPERATION_RE.search(path.read_text(encoding="utf-8-sig")))
+    except OSError:
+        has_operation_prefix = False
+    return (1 if has_operation_prefix else 0, path.name.lower())
 
 
 def merge_txt_files(source_dir: Path, output_name: str, encoding: str = "utf-8-sig") -> Path:

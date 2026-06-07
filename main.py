@@ -27,12 +27,21 @@ GOODS_INPUT_RE = re.compile(r"^goods_input_(.+)_add$")
 GOODS_OUTPUT_RE = re.compile(r"^goods_output_(.+)_add$")
 EMPLOYMENT_RE = re.compile(r"^building_employment_(.+)_add$")
 WORKFORCE_COLUMN = "workforce"
+EMPLOYMENT_TOTAL_PREFIX = "__employment__:"
 PRICE_COLUMNS = ["goods_input_price", "goods_output_prices", "profit", "profit_per_capita"]
+TOP_LEVEL_OPERATIONS = {
+    "INSERT": "INSERT",
+    "REPLACE": "REPLACE",
+    "TRY_REPLACE": "REPLACE",
+    "INJECT": "INJECT",
+    "TRY_INJECT": "INJECT",
+    "TRT_INJECT": "INJECT",
+}
 MERGE_TARGETS = (
     ("buildings", "buildings.txt"),
     ("goods", "goods.txt"),
     ("production_methods", "pm.txt"),
-    ("production_methods_groups", "pmg.txt"),
+    ("production_method_groups", "pmg.txt"),
 )
 
 
@@ -70,6 +79,7 @@ class AnalysisResult:
     pmgs: int
     pms: int
     rows: int
+    skipped_invalid_combinations: int
     item_columns: int
     output_path: Path
     localized_output_path: Path
@@ -166,7 +176,8 @@ class Parser:
         while not self.is_at_end():
             key = self.expect_atom()
             self.expect("=")
-            add_pair(result, key.value, self.parse_value())
+            operation, object_name = split_top_level_key(key.value)
+            apply_top_level_object(result, operation, object_name, self.parse_value(), key)
         return result
 
     def parse_value(self) -> TokenValue:
@@ -257,6 +268,67 @@ def add_pair(mapping: dict[str, TokenValue], key: str, value: TokenValue) -> Non
         existing.append(value)
     else:
         mapping[key] = RepeatedKey([existing, value])
+
+
+def split_top_level_key(raw_key: str) -> tuple[str, str]:
+    prefix, separator, object_name = raw_key.partition(":")
+    if separator and prefix in TOP_LEVEL_OPERATIONS and object_name:
+        return TOP_LEVEL_OPERATIONS[prefix], object_name
+    return "INSERT", raw_key
+
+
+def apply_top_level_object(
+    objects: dict[str, TokenValue],
+    operation: str,
+    object_name: str,
+    value: TokenValue,
+    token: Token,
+) -> None:
+    if operation == "INSERT":
+        if object_name in objects:
+            raise DataError(
+                f"INSERT object {object_name!r} already exists at line {token.line}, column {token.column}"
+            )
+        objects[object_name] = value
+        return
+
+    if operation == "REPLACE":
+        if object_name not in objects:
+            raise DataError(
+                f"REPLACE object {object_name!r} does not exist at line {token.line}, column {token.column}"
+            )
+        objects[object_name] = value
+        return
+
+    if operation == "INJECT":
+        if object_name not in objects:
+            raise DataError(
+                f"INJECT object {object_name!r} does not exist at line {token.line}, column {token.column}"
+            )
+        objects[object_name] = merge_values(objects[object_name], value)
+        return
+
+    raise DataError(f"Unsupported top-level operation {operation!r} at line {token.line}, column {token.column}")
+
+
+def merge_values(existing: TokenValue, incoming: TokenValue) -> TokenValue:
+    if isinstance(existing, dict) and isinstance(incoming, dict):
+        for key, incoming_value in incoming.items():
+            if key in existing:
+                existing[key] = merge_values(existing[key], incoming_value)
+            else:
+                existing[key] = incoming_value
+        return existing
+
+    if isinstance(existing, list) and isinstance(incoming, list):
+        existing.extend(incoming)
+        return existing
+
+    if isinstance(existing, RepeatedKey):
+        existing.append(incoming)
+        return existing
+
+    return incoming
 
 
 def atom_to_scalar(token: Token) -> str | int | float:
@@ -355,19 +427,28 @@ def extract_pm_modifiers(pm_name: str, pm_object: TokenValue) -> Counter[str]:
             modifiers[output_match.group(1)] += number_value(value, f"{pm_name}.{key}")
 
     level_scaled = get_dict_path(pm_object, "building_modifiers", "level_scaled")
-    workforce = 0
     for key, value in level_scaled.items():
         employment_match = EMPLOYMENT_RE.match(key)
         if employment_match:
-            workforce += int_value(value, f"{pm_name}.{key}")
-    if workforce != 0:
-        modifiers[WORKFORCE_COLUMN] += workforce
+            employment_name = employment_match.group(1)
+            modifiers[f"{EMPLOYMENT_TOTAL_PREFIX}{employment_name}"] += int_value(value, f"{pm_name}.{key}")
 
     return Counter({key: value for key, value in modifiers.items() if value != 0})
 
 
 def extract_all_pm_modifiers(pm_objects: dict[str, TokenValue]) -> dict[str, Counter[str]]:
     return {pm_name: extract_pm_modifiers(pm_name, pm_object) for pm_name, pm_object in pm_objects.items()}
+
+
+def extract_pm_unlock_requirements(pm_objects: dict[str, TokenValue]) -> dict[str, set[str]]:
+    requirements: dict[str, set[str]] = {}
+    for pm_name, pm_object in pm_objects.items():
+        if not isinstance(pm_object, dict):
+            continue
+        required_pm_names = set(as_string_list(pm_object.get("unlocking_production_methods")))
+        if required_pm_names:
+            requirements[pm_name] = required_pm_names
+    return requirements
 
 
 def extract_goods_costs(goods_objects: dict[str, TokenValue]) -> dict[str, Numeric]:
@@ -450,18 +531,46 @@ def get_pmg_choices(
     return choices
 
 
+def is_combination_legal(combination: tuple[str, ...], pm_unlock_requirements: dict[str, set[str]]) -> bool:
+    selected_pm_names = set(combination)
+    for pm_name in combination:
+        required_pm_names = pm_unlock_requirements.get(pm_name)
+        if required_pm_names and selected_pm_names.isdisjoint(required_pm_names):
+            return False
+    return True
+
+
+def finalize_workforce(totals: Counter[str]) -> None:
+    workforce = 0
+    employment_keys: list[str] = []
+
+    for item_name, amount in totals.items():
+        if not item_name.startswith(EMPLOYMENT_TOTAL_PREFIX):
+            continue
+        employment_keys.append(item_name)
+        workforce += max(amount, 0)
+
+    for item_name in employment_keys:
+        del totals[item_name]
+
+    if workforce:
+        totals[WORKFORCE_COLUMN] = workforce
+
+
 def generate_combinations(
     building_objects: dict[str, TokenValue],
     pmg_objects: dict[str, TokenValue],
     pm_objects: dict[str, TokenValue],
     pm_modifiers: dict[str, Counter[str]],
+    pm_unlock_requirements: dict[str, set[str]],
     strict: bool = False,
     missing_pm: str = "zero",
-) -> tuple[list[CombinationRow], int, set[str], set[str]]:
+) -> tuple[list[CombinationRow], int, set[str], set[str], int]:
     rows: list[CombinationRow] = []
     warnings: set[str] = set()
     used_pm_names: set[str] = set()
     max_pmg_columns = 0
+    skipped_invalid_combinations = 0
 
     for building_name, building_object in building_objects.items():
         if not isinstance(building_object, dict):
@@ -484,14 +593,18 @@ def generate_combinations(
         max_pmg_columns = max(max_pmg_columns, len(choices))
         method_lists = [method_names for _pmg_name, method_names in choices]
         for combination in product(*method_lists):
+            if not is_combination_legal(combination, pm_unlock_requirements):
+                skipped_invalid_combinations += 1
+                continue
             totals: Counter[str] = Counter()
             for pm_name in combination:
                 used_pm_names.add(pm_name)
                 for item_name, amount in pm_modifiers.get(pm_name, {}).items():
                     totals[item_name] += amount
+            finalize_workforce(totals)
             rows.append(CombinationRow(building_name, building_group, tuple(combination), totals))
 
-    return rows, max_pmg_columns, warnings, used_pm_names
+    return rows, max_pmg_columns, warnings, used_pm_names, skipped_invalid_combinations
 
 
 def collect_item_names(pm_modifiers: dict[str, Counter[str]], used_pm_names: set[str]) -> list[str]:
@@ -502,6 +615,8 @@ def collect_item_names(pm_modifiers: dict[str, Counter[str]], used_pm_names: set
         if pm_name not in used_pm_names:
             continue
         for item_name in modifiers:
+            if item_name.startswith(EMPLOYMENT_TOTAL_PREFIX):
+                continue
             if item_name not in seen:
                 seen.add(item_name)
                 item_names.append(item_name)
@@ -588,13 +703,15 @@ def run_analysis(
     pm_objects = parse_file(merged_files["pm.txt"])
     goods_objects = parse_file(merged_files["goods.txt"])
     pm_modifiers = extract_all_pm_modifiers(pm_objects)
+    pm_unlock_requirements = extract_pm_unlock_requirements(pm_objects)
     goods_costs = extract_goods_costs(goods_objects)
 
-    rows, max_pmg_columns, warnings, used_pm_names = generate_combinations(
+    rows, max_pmg_columns, warnings, used_pm_names, skipped_invalid_combinations = generate_combinations(
         building_objects,
         pmg_objects,
         pm_objects,
         pm_modifiers,
+        pm_unlock_requirements,
         strict=strict,
         missing_pm=missing_pm,
     )
@@ -609,6 +726,7 @@ def run_analysis(
         pmgs=len(pmg_objects),
         pms=len(pm_objects),
         rows=len(rows),
+        skipped_invalid_combinations=skipped_invalid_combinations,
         item_columns=len(item_names),
         output_path=output_path,
         localized_output_path=localized_output_path,
@@ -694,6 +812,11 @@ def main(argv: list[str] | None = None) -> int:
         f"Parsed {result.buildings} buildings, {result.pmgs} production method groups, "
         f"and {result.pms} production methods."
     )
+    if result.skipped_invalid_combinations:
+        print(
+            f"Skipped {result.skipped_invalid_combinations} combinations whose "
+            "unlocking_production_methods requirements were not selected."
+        )
     print(f"Wrote {result.rows} combinations with {result.item_columns} item columns to {result.output_path}.")
     print(f"Wrote {result.localized_rows} localized CSV rows to {result.localized_output_path}.")
     return 0
